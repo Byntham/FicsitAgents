@@ -28,7 +28,7 @@
 
 namespace
 {
-	const TCHAR* ModVersion = TEXT("0.2.0");
+	const TCHAR* ModVersion = TEXT("0.2.2");
 
 	TArray<TSharedPtr<FJsonValue>> Vec(const FVector& V)
 	{

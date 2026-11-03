@@ -135,23 +135,26 @@ namespace
 				Hologram->ValidatePlacementAndCost(Pawn->GetInventory());
 				TArray<TSubclassOf<UFGConstructDisqualifier>> Disq;
 				Hologram->GetConstructDisqualifiers(Disq);
-				const bool bInitializing = Disq.ContainsByPredicate([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && D->GetName() == TEXT("FGCDInitializing"); });
-				if (bInitializing && Step < 240)
+				// FGCDInitializing never clears outside the build gun (it is a build gun UI state). Give placement a
+				// few ticks to settle, then ignore it. Real problems (clearance, overlap) still show as their own disqualifiers.
+				if (Step < 6)
 				{
 					return false;
 				}
+				const int32 Ignored = Disq.RemoveAll([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && D->GetName() == TEXT("FGCDInitializing"); });
 				bReported = true;
 
 				// The game's own cost check only looks at the player's inventory. Like the build gun, we also allow the Dimensional Depot.
 				Disq.RemoveAll([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && D->GetName() == TEXT("FGCDCannotAfford"); });
 				const bool bAfford = CanAfford(Pawn, Hologram->GetCost(true));
-				const bool bPlacementOk = bHit && Disq.Num() == 0;
+				const bool bPlacementOk = bHit && Disq.Num() == 0;  // CanConstruct() is false while FGCDInitializing is set, so we judge by the list
 
 				Result = MakeShared<FJsonObject>();
 				Result->SetBoolField(TEXT("hit_surface"), bHit);
 				Result->SetStringField(TEXT("hit_actor"), HitActor);
 				Result->SetBoolField(TEXT("exact"), bExact);
 				Result->SetNumberField(TEXT("ticks"), Step);
+				Result->SetBoolField(TEXT("ignored_initializing"), Ignored > 0);
 				Result->SetArrayField(TEXT("loc"), V3(Hologram->GetActorLocation()));
 				Result->SetNumberField(TEXT("yaw"), FMath::RoundToDouble(Hologram->GetActorRotation().Yaw * 10) / 10);
 				Result->SetBoolField(TEXT("placement_ok"), bPlacementOk);

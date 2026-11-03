@@ -11,6 +11,7 @@
 #include "FGRecipe.h"
 #include "FGRecipeManager.h"
 #include "FGBuildableSubsystem.h"
+#include "FGCentralStorageSubsystem.h"
 #include "FGConstructDisqualifier.h"
 #include "FGDismantleInterface.h"
 #include "ItemAmount.h"
@@ -110,9 +111,7 @@ namespace
 				Server.ReplyError(Req, 409, TEXT("Player left the game"));
 				return true;
 			}
-			switch (Step++)
-			{
-			case 0:
+			if (Step++ == 0)
 			{
 				Hologram = AFGHologram::SpawnHologramFromRecipe(Recipe, Pawn, Loc, Pawn);
 				if (!Hologram.IsValid())
@@ -124,15 +123,6 @@ namespace
 				Place();
 				return false;
 			}
-			case 1:
-			case 2:
-				// Place again on later ticks so overlap and clearance state is current.
-				Place();
-				return false;
-			default:
-				break;
-			}
-
 			if (!Hologram.IsValid())
 			{
 				Server.ReplyError(Req, 500, TEXT("Hologram was destroyed"));
@@ -140,16 +130,33 @@ namespace
 			}
 			if (!bReported)
 			{
-				bReported = true;
+				// Re-place and validate every tick until the hologram has finished initializing.
+				Place();
 				Hologram->ValidatePlacementAndCost(Pawn->GetInventory());
 				TArray<TSubclassOf<UFGConstructDisqualifier>> Disq;
 				Hologram->GetConstructDisqualifiers(Disq);
+				const bool bInitializing = Disq.ContainsByPredicate([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && D->GetName() == TEXT("FGCDInitializing"); });
+				if (bInitializing && Step < 240)
+				{
+					return false;
+				}
+				bReported = true;
+
+				// The game's own cost check only looks at the player's inventory. Like the build gun, we also allow the Dimensional Depot.
+				Disq.RemoveAll([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && D->GetName() == TEXT("FGCDCannotAfford"); });
+				const bool bAfford = CanAfford(Pawn, Hologram->GetCost(true));
+				const bool bPlacementOk = bHit && Disq.Num() == 0;
+
 				Result = MakeShared<FJsonObject>();
 				Result->SetBoolField(TEXT("hit_surface"), bHit);
 				Result->SetStringField(TEXT("hit_actor"), HitActor);
+				Result->SetBoolField(TEXT("exact"), bExact);
+				Result->SetNumberField(TEXT("ticks"), Step);
 				Result->SetArrayField(TEXT("loc"), V3(Hologram->GetActorLocation()));
 				Result->SetNumberField(TEXT("yaw"), FMath::RoundToDouble(Hologram->GetActorRotation().Yaw * 10) / 10);
-				Result->SetBoolField(TEXT("valid"), bHit && Hologram->CanConstruct() && Disq.Num() == 0);
+				Result->SetBoolField(TEXT("placement_ok"), bPlacementOk);
+				Result->SetBoolField(TEXT("affordable"), bAfford);
+				Result->SetBoolField(TEXT("valid"), bPlacementOk && bAfford);
 				TArray<TSharedPtr<FJsonValue>> DJ;
 				for (const TSubclassOf<UFGConstructDisqualifier>& D : Disq)
 				{
@@ -182,6 +189,25 @@ namespace
 		void Place()
 		{
 			if (!Hologram.IsValid()) return;
+			if (bExact)
+			{
+				// Exact placement: no surface needed (floating platforms). Feed the hologram a synthetic
+				// upward-facing hit at the target, then pin it to the exact transform the agent asked for.
+				FHitResult Hit;
+				Hit.bBlockingHit = true;
+				Hit.Location = Hit.ImpactPoint = Loc;
+				Hit.Normal = Hit.ImpactNormal = FVector::UpVector;
+				Hit.TraceStart = Loc + FVector(0, 0, 150);
+				Hit.TraceEnd = Loc - FVector(0, 0, 400);
+				if (Hologram->IsValidHitResult(Hit))
+				{
+					Hologram->UpdateHologramPlacement(Hit);
+				}
+				Hologram->SetActorLocationAndRotation(Loc, FRotator(0, Yaw, 0));
+				bHit = true;
+				HitActor = TEXT("(exact)");
+				return;
+			}
 			FHitResult Hit;
 			FCollisionQueryParams Q(TEXT("FicsitAgentsBuild"), false);
 			Q.AddIgnoredActor(Hologram.Get());
@@ -206,17 +232,11 @@ namespace
 		{
 			UFGInventoryComponent* Inv = Pawn->GetInventory();
 			const TArray<FItemAmount> Cost = Hologram->GetCost(true);
-			if (!Inv->GetNoBuildCost())
+			if (!CanAfford(Pawn, Cost))
 			{
-				for (const FItemAmount& A : Cost)
-				{
-					if (!Inv->HasItems(A.ItemClass, A.Amount))
-					{
-						Result->SetBoolField(TEXT("built"), false);
-						Result->SetStringField(TEXT("error"), TEXT("Not enough items in the player's inventory"));
-						return;
-					}
-				}
+				Result->SetBoolField(TEXT("built"), false);
+				Result->SetStringField(TEXT("error"), TEXT("Not enough items in the player's inventory and Dimensional Depot"));
+				return;
 			}
 			bool bPlaced = false;
 			for (int32 i = 0; i < 8 && !bPlaced; ++i)
@@ -234,14 +254,13 @@ namespace
 			AActor* Built = Hologram->Construct(Children, BS->GetNewNetConstructionID());
 			if (!Built)
 			{
-				Result->SetBoolField(TEXT("built"), false);
-				Result->SetStringField(TEXT("error"), TEXT("Construct returned nothing"));
+				// Lightweight buildables (foundations, walls) may not return an actor. Charge anyway and say so.
+				Pay(Pawn, Cost);
+				Result->SetBoolField(TEXT("built"), true);
+				Result->SetStringField(TEXT("note"), TEXT("Construct returned no actor (lightweight buildable?). Not undoable yet; verify with query_area."));
 				return;
 			}
-			if (!Inv->GetNoBuildCost())
-			{
-				for (const FItemAmount& A : Cost) Inv->Remove(A.ItemClass, A.Amount);
-			}
+			Pay(Pawn, Cost);
 			FBuildRecord Rec;
 			Rec.Op = GNextOp++;
 			Rec.Actors.Add(Built);
@@ -263,6 +282,37 @@ namespace
 			Result->SetNumberField(TEXT("yaw"), FMath::RoundToDouble(Built->GetActorRotation().Yaw * 10) / 10);
 		}
 
+		/** Player inventory plus Dimensional Depot, like the build gun. */
+		bool CanAfford(AFGCharacterPlayer* Pawn, const TArray<FItemAmount>& Cost) const
+		{
+			UFGInventoryComponent* Inv = Pawn->GetInventory();
+			if (Inv->GetNoBuildCost()) return true;
+			AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World.Get());
+			for (const FItemAmount& A : Cost)
+			{
+				const int32 Have = Inv->GetNumItems(A.ItemClass) + (Depot ? Depot->GetNumItemsFromCentralStorage(A.ItemClass) : 0);
+				if (Have < A.Amount) return false;
+			}
+			return true;
+		}
+
+		void Pay(AFGCharacterPlayer* Pawn, const TArray<FItemAmount>& Cost) const
+		{
+			UFGInventoryComponent* Inv = Pawn->GetInventory();
+			if (Inv->GetNoBuildCost()) return;
+			AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World.Get());
+			for (const FItemAmount& A : Cost)
+			{
+				const int32 FromInv = FMath::Min(A.Amount, Inv->GetNumItems(A.ItemClass));
+				if (FromInv > 0) Inv->Remove(A.ItemClass, FromInv);
+				if (A.Amount - FromInv > 0 && Depot) Depot->TryRemoveItemsFromCentralStorage(A.ItemClass, A.Amount - FromInv);
+			}
+		}
+
+	public:
+		bool bExact = false;
+
+	private:
 		TWeakObjectPtr<UWorld> World;
 		TSubclassOf<UFGRecipe> Recipe;
 		FVector Loc;
@@ -337,7 +387,11 @@ namespace FABuild
 		Req.Params->TryGetNumberField(TEXT("yaw"), Yaw);
 		Req.Params->TryGetBoolField(TEXT("dry_run"), bDryRun);
 		Req.Params->TryGetNumberField(TEXT("hold"), Hold);
-		Server.AddOp(MakeShared<FBuildOp>(Req, World, Recipe, Loc, (float)Yaw, bDryRun, (float)FMath::Clamp(Hold, 0.0, 30.0)));
+		bool bExact = false;
+		Req.Params->TryGetBoolField(TEXT("exact"), bExact);
+		const TSharedRef<FBuildOp> Op = MakeShared<FBuildOp>(Req, World, Recipe, Loc, (float)Yaw, bDryRun, (float)FMath::Clamp(Hold, 0.0, 30.0));
+		Op->bExact = bExact;
+		Server.AddOp(Op);
 	}
 
 	void Dismantle(FFAServer& Server, const FFARequest& Req)

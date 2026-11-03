@@ -20,6 +20,7 @@
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Buildables/FGBuildableConveyorBelt.h"
 #include "Buildables/FGBuildableConveyorLift.h"
+#include "Buildables/FGBuildableBlueprintDesigner.h"
 #include "FGFactoryConnectionComponent.h"
 #include "FGPipeConnectionComponent.h"
 #include "FGLightweightBuildableSubsystem.h"
@@ -28,7 +29,7 @@
 
 namespace
 {
-	const TCHAR* ModVersion = TEXT("0.3.0");
+	const TCHAR* ModVersion = TEXT("0.3.1");
 
 	TArray<TSharedPtr<FJsonValue>> Vec(const FVector& V)
 	{
@@ -226,6 +227,10 @@ namespace
 			if (const AFGBuildableConveyorLift* Lift = Cast<AFGBuildableConveyorLift>(B))
 			{
 				E->SetArrayField(TEXT("top"), Vec(Lift->GetActorTransform().TransformPosition(Lift->GetTopTransform().GetLocation())));
+			}
+			if (const AFGBuildableBlueprintDesigner* D = Cast<AFGBuildableBlueprintDesigner>(B))
+			{
+				E->SetArrayField(TEXT("designer_size"), Vec(D->GetBlueprintDesignerSize()));
 			}
 			Out.Add(MakeShared<FJsonValueObject>(E));
 		}

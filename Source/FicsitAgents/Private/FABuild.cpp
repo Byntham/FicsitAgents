@@ -21,6 +21,7 @@
 #include "FGLightweightBuildableSubsystem.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableManufacturer.h"
+#include "Buildables/FGBuildableBlueprintDesigner.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Resources/FGBuildingDescriptor.h"
 
@@ -80,6 +81,16 @@ namespace
 		for (TActorIterator<AFGBuildable> It(World); It; ++It)
 		{
 			if (It->GetName() == Id) return *It;
+		}
+		return nullptr;
+	}
+
+	/** The blueprint designer containing this point, if any. Holograms must be told, like the build gun does. */
+	AFGBuildableBlueprintDesigner* DesignerAt(UWorld* World, const FVector& Loc)
+	{
+		for (TActorIterator<AFGBuildableBlueprintDesigner> It(World); It; ++It)
+		{
+			if (It->IsLocationInsideDesigner(Loc)) return *It;
 		}
 		return nullptr;
 	}
@@ -254,6 +265,11 @@ namespace
 					Server.ReplyError(Req, 500, TEXT("Could not spawn a hologram for this recipe"));
 					return true;
 				}
+				if (AFGBuildableBlueprintDesigner* D = DesignerAt(World.Get(), Loc))
+				{
+					Hologram->SetInsideBlueprintDesigner(D);
+					DesignerName = D->GetName();
+				}
 				Hologram->SetScrollRotateValue(FMath::RoundToInt(Yaw));
 				Place();
 				return false;
@@ -288,6 +304,7 @@ namespace
 				Result->SetBoolField(TEXT("hit_surface"), bHit);
 				Result->SetStringField(TEXT("hit_actor"), HitActor);
 				Result->SetBoolField(TEXT("exact"), bExact);
+				if (!DesignerName.IsEmpty()) Result->SetStringField(TEXT("designer"), DesignerName);
 				Result->SetNumberField(TEXT("ticks"), Step);
 				Result->SetBoolField(TEXT("ignored_initializing"), Ignored > 0);
 				Result->SetArrayField(TEXT("loc"), V3(Hologram->GetActorLocation()));
@@ -397,6 +414,7 @@ namespace
 		bool bReported = false;
 		double HoldUntil = 0;
 		FString HitActor;
+		FString DesignerName;
 		TWeakObjectPtr<AFGHologram> Hologram;
 		TSharedPtr<FJsonObject> Result;
 	};
@@ -492,6 +510,10 @@ namespace
 				{
 					Server.ReplyError(Req, 500, TEXT("Could not spawn a hologram for this recipe"));
 					return true;
+				}
+				if (AFGBuildableBlueprintDesigner* D = DesignerAt(World.Get(), A->GetComponentLocation()))
+				{
+					Hologram->SetInsideBlueprintDesigner(D);
 				}
 				return false;
 			}

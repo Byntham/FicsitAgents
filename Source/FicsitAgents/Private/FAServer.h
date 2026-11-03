@@ -83,3 +83,12 @@ namespace FACommands
 	UWorld* FindGameWorld();
 	bool Handle(FFAServer& Server, const FFARequest& Req);
 }
+
+namespace FABuild
+{
+	void Build(FFAServer& Server, const FFARequest& Req);
+	void Dismantle(FFAServer& Server, const FFARequest& Req);
+	void Undo(FFAServer& Server, const FFARequest& Req);
+	void ListRecipes(FFAServer& Server, const FFARequest& Req);
+	void SetRecipe(FFAServer& Server, const FFARequest& Req);
+}

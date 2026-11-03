@@ -24,10 +24,11 @@
 #include "FGPipeConnectionComponent.h"
 #include "FGLightweightBuildableSubsystem.h"
 #include "FGRecipe.h"
+#include "FGCharacterPlayer.h"
 
 namespace
 {
-	const TCHAR* ModVersion = TEXT("0.1.0");
+	const TCHAR* ModVersion = TEXT("0.2.0");
 
 	TArray<TSharedPtr<FJsonValue>> Vec(const FVector& V)
 	{
@@ -65,10 +66,11 @@ namespace
 		return CapturesDir() / FString::Printf(TEXT("%s_%s.png"), *Prefix, *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S_%s")));
 	}
 
+	/** The player's character, only when a save is loaded (the main menu has a different pawn). */
 	APawn* PlayerPawn(UWorld* World)
 	{
 		APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
-		return PC ? PC->GetPawn() : nullptr;
+		return PC ? Cast<AFGCharacterPlayer>(PC->GetPawn()) : nullptr;
 	}
 
 	// ---------------------------------------------------------------- hello / player
@@ -289,7 +291,7 @@ namespace
 	class FCaptureOp : public FFAPendingOp
 	{
 	public:
-		FCaptureOp(const FFARequest& InReq, UWorld* World, const FVector& Loc, const FRotator& Rot, float Fov, int32 InW, int32 InH, int32 InWarmup)
+		FCaptureOp(const FFARequest& InReq, UWorld* World, const FVector& Loc, const FRotator& Rot, float Fov, float OrthoWidth, int32 InW, int32 InH, int32 InWarmup)
 			: FFAPendingOp(InReq), W(InW), H(InH), Warmup(InWarmup)
 		{
 			FActorSpawnParameters SP;
@@ -308,6 +310,15 @@ namespace
 				C->bCaptureEveryFrame = true;
 				C->bCaptureOnMovement = false;
 				C->bAlwaysPersistRenderingState = true;
+				if (OrthoWidth > 0)
+				{
+					// Orthographic with the near plane at the camera: nothing behind (above) the camera is drawn,
+					// so a downward camera placed inside a layer gives a cutaway floor plan.
+					C->ProjectionType = ECameraProjectionMode::Orthographic;
+					C->OrthoWidth = OrthoWidth;
+					C->bAutoCalculateOrthoPlanes = false;
+					C->bUpdateOrthoPlanes = false;
+				}
 			}
 		}
 
@@ -383,14 +394,15 @@ namespace
 		{
 			Rot = FRotator(Pyr.X, Pyr.Y, Pyr.Z);
 		}
-		double Fov = 90, W = 1280, H = 720, Warmup = 8;
+		double Fov = 90, W = 1280, H = 720, Warmup = 8, Ortho = 0;
 		Req.Params->TryGetNumberField(TEXT("fov"), Fov);
+		Req.Params->TryGetNumberField(TEXT("ortho_width"), Ortho);
 		Req.Params->TryGetNumberField(TEXT("w"), W);
 		Req.Params->TryGetNumberField(TEXT("h"), H);
 		Req.Params->TryGetNumberField(TEXT("warmup"), Warmup);
 		W = FMath::Clamp(W, 64, 3840);
 		H = FMath::Clamp(H, 64, 2160);
-		Server.AddOp(MakeShared<FCaptureOp>(Req, World, Loc, Rot, (float)Fov, (int32)W, (int32)H, (int32)Warmup));
+		Server.AddOp(MakeShared<FCaptureOp>(Req, World, Loc, Rot, (float)Fov, (float)Ortho, (int32)W, (int32)H, (int32)Warmup));
 	}
 
 	// ---------------------------------------------------------------- viewport screenshot (what the player sees)
@@ -456,6 +468,11 @@ bool FACommands::Handle(FFAServer& Server, const FFARequest& Req)
 		{TEXT("query_area"), &QueryArea},
 		{TEXT("capture"), &Capture},
 		{TEXT("screenshot"), &Screenshot},
+		{TEXT("build"), &FABuild::Build},
+		{TEXT("dismantle"), &FABuild::Dismantle},
+		{TEXT("undo"), &FABuild::Undo},
+		{TEXT("list_recipes"), &FABuild::ListRecipes},
+		{TEXT("set_recipe"), &FABuild::SetRecipe},
 	};
 	if (const FHandler* H = Table.Find(Req.Method))
 	{

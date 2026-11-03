@@ -88,6 +88,7 @@ namespace FABuild
 {
 	void Build(FFAServer& Server, const FFARequest& Req);
 	void Dismantle(FFAServer& Server, const FFARequest& Req);
+	void Connect(FFAServer& Server, const FFARequest& Req);
 	void Undo(FFAServer& Server, const FFARequest& Req);
 	void ListRecipes(FFAServer& Server, const FFARequest& Req);
 	void SetRecipe(FFAServer& Server, const FFARequest& Req);

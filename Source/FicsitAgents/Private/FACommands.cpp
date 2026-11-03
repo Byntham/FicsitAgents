@@ -28,7 +28,7 @@
 
 namespace
 {
-	const TCHAR* ModVersion = TEXT("0.2.2");
+	const TCHAR* ModVersion = TEXT("0.3.0");
 
 	TArray<TSharedPtr<FJsonValue>> Vec(const FVector& V)
 	{
@@ -470,6 +470,7 @@ bool FACommands::Handle(FFAServer& Server, const FFARequest& Req)
 		{TEXT("screenshot"), &Screenshot},
 		{TEXT("build"), &FABuild::Build},
 		{TEXT("dismantle"), &FABuild::Dismantle},
+		{TEXT("connect"), &FABuild::Connect},
 		{TEXT("undo"), &FABuild::Undo},
 		{TEXT("list_recipes"), &FABuild::ListRecipes},
 		{TEXT("set_recipe"), &FABuild::SetRecipe},

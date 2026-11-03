@@ -16,6 +16,9 @@
 #include "FGDismantleInterface.h"
 #include "ItemAmount.h"
 #include "Hologram/FGHologram.h"
+#include "Hologram/FGSplineHologram.h"
+#include "FGFactoryConnectionComponent.h"
+#include "FGLightweightBuildableSubsystem.h"
 #include "Buildables/FGBuildable.h"
 #include "Buildables/FGBuildableManufacturer.h"
 #include "Resources/FGItemDescriptor.h"
@@ -82,13 +85,145 @@ namespace
 	}
 
 	/** Every completed build, so it can be undone. Lives as long as the game process. */
+	struct FLightweightRecord
+	{
+		TSubclassOf<AFGBuildable> Cls;
+		FVector Loc;
+		TSubclassOf<UFGRecipe> Recipe;
+	};
 	struct FBuildRecord
 	{
 		int32 Op = 0;
 		TArray<TWeakObjectPtr<AActor>> Actors;
+		TArray<FLightweightRecord> Lightweights;
 	};
 	TArray<FBuildRecord> GBuildLog;
 	int32 GNextOp = 1;
+
+	/** Player inventory plus Dimensional Depot, like the build gun. */
+	bool CanAfford(UWorld* World, AFGCharacterPlayer* Pawn, const TArray<FItemAmount>& Cost)
+	{
+		UFGInventoryComponent* Inv = Pawn->GetInventory();
+		if (Inv->GetNoBuildCost()) return true;
+		AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World);
+		for (const FItemAmount& A : Cost)
+		{
+			const int32 Have = Inv->GetNumItems(A.ItemClass) + (Depot ? Depot->GetNumItemsFromCentralStorage(A.ItemClass) : 0);
+			if (Have < A.Amount) return false;
+		}
+		return true;
+	}
+
+	void Pay(UWorld* World, AFGCharacterPlayer* Pawn, const TArray<FItemAmount>& Cost)
+	{
+		UFGInventoryComponent* Inv = Pawn->GetInventory();
+		if (Inv->GetNoBuildCost()) return;
+		AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World);
+		for (const FItemAmount& A : Cost)
+		{
+			const int32 FromInv = FMath::Min(A.Amount, Inv->GetNumItems(A.ItemClass));
+			if (FromInv > 0) Inv->Remove(A.ItemClass, FromInv);
+			if (A.Amount - FromInv > 0 && Depot) Depot->TryRemoveItemsFromCentralStorage(A.ItemClass, A.Amount - FromInv);
+		}
+	}
+
+	/** Removes a lightweight instance (foundation, wall...) found by class and position. Refunds the recipe if building costs items. */
+	bool RemoveLightweight(UWorld* World, TSubclassOf<AFGBuildable> Cls, const FVector& Loc, TSubclassOf<UFGRecipe> Recipe, UFGInventoryComponent* Inv, TArray<FInventoryStack>& OutRefund)
+	{
+		AFGLightweightBuildableSubsystem* LW = AFGLightweightBuildableSubsystem::Get(World);
+		if (!LW || !Cls) return false;
+		const TArray<FRuntimeBuildableInstanceData>* Arr = LW->GetAllLightweightBuildableInstances().Find(Cls);
+		if (!Arr) return false;
+		for (int32 i = 0; i < Arr->Num(); ++i)
+		{
+			const FRuntimeBuildableInstanceData& D = (*Arr)[i];
+			if (D.BuiltWithRecipe && FVector::Dist(D.Transform.GetLocation(), Loc) < 5.0)
+			{
+				FLightweightBuildableInstanceRef Ref;
+				Ref.Initialize(LW, Cls, i);
+				if (!Ref.Remove()) return false;
+				if (Inv && !Inv->GetNoBuildCost() && Recipe)
+				{
+					for (const FItemAmount& A : UFGRecipe::GetIngredients(World, Recipe))
+					{
+						const FInventoryStack S(A.Amount, A.ItemClass);
+						Inv->AddStack(S, true);
+						OutRefund.Add(S);
+					}
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Constructs a placed hologram, pays for it, records it for undo and fills Result.
+	 * Lightweight buildables come back as a temporary actor that is gone a moment later, so record them by class and position.
+	 */
+	void FinishConstruct(UWorld* World, AFGHologram* Hologram, AFGCharacterPlayer* Pawn, const TSharedPtr<FJsonObject>& Result)
+	{
+		const TArray<FItemAmount> Cost = Hologram->GetCost(true);
+		if (!CanAfford(World, Pawn, Cost))
+		{
+			Result->SetBoolField(TEXT("built"), false);
+			Result->SetStringField(TEXT("error"), TEXT("Not enough items in the player's inventory and Dimensional Depot"));
+			return;
+		}
+		AFGBuildableSubsystem* BS = AFGBuildableSubsystem::Get(World);
+		TArray<AActor*> Children;
+		AActor* Built = Hologram->Construct(Children, BS->GetNewNetConstructionID());
+		if (!Built)
+		{
+			Result->SetBoolField(TEXT("built"), false);
+			Result->SetStringField(TEXT("error"), TEXT("Construct returned nothing"));
+			return;
+		}
+		Pay(World, Pawn, Cost);
+		FBuildRecord Rec;
+		Rec.Op = GNextOp++;
+		TArray<TSharedPtr<FJsonValue>> Ids;
+		TArray<AActor*> All = Children;
+		All.Insert(Built, 0);
+		bool bAnyLightweight = false;
+		for (AActor* A : All)
+		{
+			if (!A) continue;
+			AFGBuildable* B = Cast<AFGBuildable>(A);
+			if (B && (B->GetIsLightweightTemporary() || B->ShouldConvertToLightweight()))
+			{
+				Rec.Lightweights.Add({B->GetClass(), B->GetActorLocation(), B->GetBuiltWithRecipe() ? B->GetBuiltWithRecipe() : Hologram->GetRecipe()});
+				bAnyLightweight = true;
+			}
+			else
+			{
+				Rec.Actors.Add(A);
+			}
+			Ids.Add(MakeShared<FJsonValueString>(A->GetName()));
+		}
+		GBuildLog.Add(Rec);
+		Result->SetBoolField(TEXT("built"), true);
+		Result->SetBoolField(TEXT("lightweight"), bAnyLightweight);
+		Result->SetNumberField(TEXT("op"), Rec.Op);
+		Result->SetArrayField(TEXT("ids"), Ids);
+		Result->SetArrayField(TEXT("loc"), V3(Built->GetActorLocation()));
+		Result->SetNumberField(TEXT("yaw"), FMath::RoundToDouble(Built->GetActorRotation().Yaw * 10) / 10);
+		// For belts and lifts: report what the new piece actually connected to.
+		TArray<TSharedPtr<FJsonValue>> Conns;
+		TInlineComponentArray<UFGFactoryConnectionComponent*> FC(Built);
+		for (UFGFactoryConnectionComponent* C : FC)
+		{
+			const TSharedRef<FJsonObject> J = MakeShared<FJsonObject>();
+			J->SetStringField(TEXT("n"), C->GetName());
+			if (C->GetConnection() && C->GetConnection()->GetOwner())
+			{
+				J->SetStringField(TEXT("to"), C->GetConnection()->GetOwner()->GetName());
+				J->SetStringField(TEXT("toc"), C->GetConnection()->GetName());
+			}
+			Conns.Add(MakeShared<FJsonValueObject>(J));
+		}
+		Result->SetArrayField(TEXT("conns"), Conns);
+	}
 
 	// ------------------------------------------------------------------ build
 
@@ -146,7 +281,7 @@ namespace
 
 				// The game's own cost check only looks at the player's inventory. Like the build gun, we also allow the Dimensional Depot.
 				Disq.RemoveAll([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && D->GetName() == TEXT("FGCDCannotAfford"); });
-				const bool bAfford = CanAfford(Pawn, Hologram->GetCost(true));
+				const bool bAfford = CanAfford(World.Get(), Pawn, Hologram->GetCost(true));
 				const bool bPlacementOk = bHit && Disq.Num() == 0;  // CanConstruct() is false while FGCDInitializing is set, so we judge by the list
 
 				Result = MakeShared<FJsonObject>();
@@ -233,14 +368,6 @@ namespace
 
 		void Construct(AFGCharacterPlayer* Pawn)
 		{
-			UFGInventoryComponent* Inv = Pawn->GetInventory();
-			const TArray<FItemAmount> Cost = Hologram->GetCost(true);
-			if (!CanAfford(Pawn, Cost))
-			{
-				Result->SetBoolField(TEXT("built"), false);
-				Result->SetStringField(TEXT("error"), TEXT("Not enough items in the player's inventory and Dimensional Depot"));
-				return;
-			}
 			bool bPlaced = false;
 			for (int32 i = 0; i < 8 && !bPlaced; ++i)
 			{
@@ -252,64 +379,7 @@ namespace
 				Result->SetStringField(TEXT("error"), TEXT("This buildable needs multi-step placement, which build doesn't support yet"));
 				return;
 			}
-			AFGBuildableSubsystem* BS = AFGBuildableSubsystem::Get(World.Get());
-			TArray<AActor*> Children;
-			AActor* Built = Hologram->Construct(Children, BS->GetNewNetConstructionID());
-			if (!Built)
-			{
-				// Lightweight buildables (foundations, walls) may not return an actor. Charge anyway and say so.
-				Pay(Pawn, Cost);
-				Result->SetBoolField(TEXT("built"), true);
-				Result->SetStringField(TEXT("note"), TEXT("Construct returned no actor (lightweight buildable?). Not undoable yet; verify with query_area."));
-				return;
-			}
-			Pay(Pawn, Cost);
-			FBuildRecord Rec;
-			Rec.Op = GNextOp++;
-			Rec.Actors.Add(Built);
-			TArray<TSharedPtr<FJsonValue>> Ids;
-			Ids.Add(MakeShared<FJsonValueString>(Built->GetName()));
-			for (AActor* C : Children)
-			{
-				if (C)
-				{
-					Rec.Actors.Add(C);
-					Ids.Add(MakeShared<FJsonValueString>(C->GetName()));
-				}
-			}
-			GBuildLog.Add(Rec);
-			Result->SetBoolField(TEXT("built"), true);
-			Result->SetNumberField(TEXT("op"), Rec.Op);
-			Result->SetArrayField(TEXT("ids"), Ids);
-			Result->SetArrayField(TEXT("loc"), V3(Built->GetActorLocation()));
-			Result->SetNumberField(TEXT("yaw"), FMath::RoundToDouble(Built->GetActorRotation().Yaw * 10) / 10);
-		}
-
-		/** Player inventory plus Dimensional Depot, like the build gun. */
-		bool CanAfford(AFGCharacterPlayer* Pawn, const TArray<FItemAmount>& Cost) const
-		{
-			UFGInventoryComponent* Inv = Pawn->GetInventory();
-			if (Inv->GetNoBuildCost()) return true;
-			AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World.Get());
-			for (const FItemAmount& A : Cost)
-			{
-				const int32 Have = Inv->GetNumItems(A.ItemClass) + (Depot ? Depot->GetNumItemsFromCentralStorage(A.ItemClass) : 0);
-				if (Have < A.Amount) return false;
-			}
-			return true;
-		}
-
-		void Pay(AFGCharacterPlayer* Pawn, const TArray<FItemAmount>& Cost) const
-		{
-			UFGInventoryComponent* Inv = Pawn->GetInventory();
-			if (Inv->GetNoBuildCost()) return;
-			AFGCentralStorageSubsystem* Depot = AFGCentralStorageSubsystem::Get(World.Get());
-			for (const FItemAmount& A : Cost)
-			{
-				const int32 FromInv = FMath::Min(A.Amount, Inv->GetNumItems(A.ItemClass));
-				if (FromInv > 0) Inv->Remove(A.ItemClass, FromInv);
-				if (A.Amount - FromInv > 0 && Depot) Depot->TryRemoveItemsFromCentralStorage(A.ItemClass, A.Amount - FromInv);
-			}
+			FinishConstruct(World.Get(), Hologram.Get(), Pawn, Result);
 		}
 
 	public:
@@ -360,6 +430,169 @@ namespace
 		}
 		return ItemsJson(Items);
 	}
+
+	// ------------------------------------------------------------------ connect (belts and lifts, port to port)
+
+	UFGFactoryConnectionComponent* FindPort(UWorld* World, const FString& Id, const FString& Port)
+	{
+		AFGBuildable* B = FindBuildable(World, Id);
+		if (!B) return nullptr;
+		TInlineComponentArray<UFGFactoryConnectionComponent*> FC(B);
+		for (UFGFactoryConnectionComponent* C : FC)
+		{
+			if (C->GetName() == Port) return C;
+		}
+		return nullptr;
+	}
+
+	/** A hit result as if the build gun were aimed at this connection: on its owner, at the port, facing out of it. */
+	FHitResult PortHit(UFGFactoryConnectionComponent* C)
+	{
+		FHitResult H;
+		AActor* Owner = C->GetOwner();
+		H.bBlockingHit = true;
+		H.HitObjectHandle = FActorInstanceHandle(Owner);
+		H.Component = Owner->FindComponentByClass<UPrimitiveComponent>();
+		H.Location = H.ImpactPoint = C->GetComponentLocation();
+		H.Normal = H.ImpactNormal = C->GetConnectorNormal();
+		H.TraceStart = H.Location + H.Normal * 300.0;
+		H.TraceEnd = H.Location - H.Normal * 100.0;
+		H.Distance = 300.0f;
+		return H;
+	}
+
+	/**
+	 * Builds a belt or lift between two ports the way a player does: aim at port A, click, aim at port B, click.
+	 * The game does the snapping and routing.
+	 */
+	class FConnectOp : public FFAPendingOp
+	{
+	public:
+		FConnectOp(const FFARequest& InReq, UWorld* InWorld, TSubclassOf<UFGRecipe> InRecipe, UFGFactoryConnectionComponent* InA, UFGFactoryConnectionComponent* InB, bool bInDryRun)
+			: FFAPendingOp(InReq), World(InWorld), Recipe(InRecipe), A(InA), B(InB), bDryRun(bInDryRun) {}
+
+		virtual ~FConnectOp() override
+		{
+			if (Hologram.IsValid()) Hologram->Destroy();
+		}
+
+		virtual bool Tick(FFAServer& Server) override
+		{
+			AFGCharacterPlayer* Pawn = Player(World.Get());
+			if (!Pawn || !A.IsValid() || !B.IsValid())
+			{
+				Server.ReplyError(Req, 409, TEXT("Player left the game or a port disappeared"));
+				return true;
+			}
+			const int32 S = Step++;
+			if (S == 0)
+			{
+				Hologram = AFGHologram::SpawnHologramFromRecipe(Recipe, Pawn, A->GetComponentLocation(), Pawn);
+				if (!Hologram.IsValid())
+				{
+					Server.ReplyError(Req, 500, TEXT("Could not spawn a hologram for this recipe"));
+					return true;
+				}
+				return false;
+			}
+			if (!Hologram.IsValid())
+			{
+				Server.ReplyError(Req, 500, TEXT("Hologram was destroyed"));
+				return true;
+			}
+			if (S <= 3)
+			{
+				Aim(A.Get());
+				return false;
+			}
+			if (S == 4)
+			{
+				StartStep = BuildStep();
+				bFirstClickDone = Hologram->DoMultiStepPlacement(false);  // true would mean it finished in one click
+				AfterClickStep = BuildStep();
+				return false;
+			}
+			if (S <= 8)
+			{
+				Aim(B.Get());
+				return false;
+			}
+
+			Hologram->ValidatePlacementAndCost(Pawn->GetInventory());
+			TArray<TSubclassOf<UFGConstructDisqualifier>> Disq;
+			Hologram->GetConstructDisqualifiers(Disq);
+			Disq.RemoveAll([](const TSubclassOf<UFGConstructDisqualifier>& D) { return D && (D->GetName() == TEXT("FGCDInitializing") || D->GetName() == TEXT("FGCDCannotAfford")); });
+			const bool bAfford = CanAfford(World.Get(), Pawn, Hologram->GetCost(true));
+
+			const TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+			Result->SetStringField(TEXT("hologram"), Hologram->GetClass()->GetName());
+			Result->SetNumberField(TEXT("step_before_click"), StartStep);
+			Result->SetNumberField(TEXT("step_after_click"), AfterClickStep);
+			Result->SetBoolField(TEXT("finished_after_first_click"), bFirstClickDone);
+			Result->SetBoolField(TEXT("placement_ok"), Disq.Num() == 0);
+			Result->SetBoolField(TEXT("affordable"), bAfford);
+			Result->SetBoolField(TEXT("valid"), Disq.Num() == 0 && bAfford);
+			TArray<TSharedPtr<FJsonValue>> DJ;
+			for (const TSubclassOf<UFGConstructDisqualifier>& D : Disq)
+			{
+				const TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetStringField(TEXT("cls"), D ? D->GetName() : TEXT("?"));
+				O->SetStringField(TEXT("text"), UFGConstructDisqualifier::GetDisqualifyingText(D).ToString());
+				DJ.Add(MakeShared<FJsonValueObject>(O));
+			}
+			Result->SetArrayField(TEXT("disqualifiers"), DJ);
+			Result->SetArrayField(TEXT("cost"), ItemsJson(Hologram->GetCost(true)));
+
+			if (bDryRun || !Result->GetBoolField(TEXT("valid")))
+			{
+				Result->SetBoolField(TEXT("built"), false);
+			}
+			else
+			{
+				bool bDone = bFirstClickDone;
+				for (int32 i = 0; i < 6 && !bDone; ++i)
+				{
+					bDone = Hologram->DoMultiStepPlacement(false);
+				}
+				if (!bDone)
+				{
+					Result->SetBoolField(TEXT("built"), false);
+					Result->SetStringField(TEXT("error"), FString::Printf(TEXT("Placement did not finish (build step %d)"), BuildStep()));
+				}
+				else
+				{
+					FinishConstruct(World.Get(), Hologram.Get(), Pawn, Result);
+				}
+			}
+			Server.Reply(Req, Result);
+			return true;
+		}
+
+	private:
+		void Aim(UFGFactoryConnectionComponent* C)
+		{
+			const FHitResult H = PortHit(C);
+			if (Hologram->IsValidHitResult(H))
+			{
+				Hologram->UpdateHologramPlacement(H);
+			}
+		}
+
+		int32 BuildStep() const
+		{
+			AFGSplineHologram* SH = Cast<AFGSplineHologram>(Hologram.Get());
+			return SH ? (int32)SH->GetCurrentBuildStep() : -1;
+		}
+
+		TWeakObjectPtr<UWorld> World;
+		TSubclassOf<UFGRecipe> Recipe;
+		TWeakObjectPtr<UFGFactoryConnectionComponent> A, B;
+		bool bDryRun;
+		int32 Step = 0;
+		int32 StartStep = -1, AfterClickStep = -1;
+		bool bFirstClickDone = false;
+		TWeakObjectPtr<AFGHologram> Hologram;
+	};
 }
 
 namespace FABuild
@@ -397,6 +630,42 @@ namespace FABuild
 		Server.AddOp(Op);
 	}
 
+	void Connect(FFAServer& Server, const FFARequest& Req)
+	{
+		UWorld* World = FACommands::FindGameWorld();
+		if (!Player(World))
+		{
+			Server.ReplyError(Req, 409, TEXT("No game loaded"));
+			return;
+		}
+		FString RecipeName, FromId, FromPort, ToId, ToPort;
+		const TSharedPtr<FJsonObject>* From = nullptr;
+		const TSharedPtr<FJsonObject>* To = nullptr;
+		if (!Req.Params->TryGetStringField(TEXT("recipe"), RecipeName) || !Req.Params->TryGetObjectField(TEXT("from"), From) || !Req.Params->TryGetObjectField(TEXT("to"), To) ||
+		    !(*From)->TryGetStringField(TEXT("id"), FromId) || !(*From)->TryGetStringField(TEXT("port"), FromPort) ||
+		    !(*To)->TryGetStringField(TEXT("id"), ToId) || !(*To)->TryGetStringField(TEXT("port"), ToPort))
+		{
+			Server.ReplyError(Req, 400, TEXT("connect needs recipe (belt or lift), from {id, port}, to {id, port}"));
+			return;
+		}
+		const TSubclassOf<UFGRecipe> Recipe = FindAvailableRecipe(World, RecipeName);
+		UFGFactoryConnectionComponent* A = FindPort(World, FromId, FromPort);
+		UFGFactoryConnectionComponent* B = FindPort(World, ToId, ToPort);
+		if (!Recipe || !A || !B)
+		{
+			Server.ReplyError(Req, 404, FString::Printf(TEXT("Not found: %s%s%s"), Recipe ? TEXT("") : TEXT("recipe (or locked) "), A ? TEXT("") : TEXT("from-port "), B ? TEXT("") : TEXT("to-port")));
+			return;
+		}
+		if (A->IsConnected() || B->IsConnected())
+		{
+			Server.ReplyError(Req, 409, TEXT("One of the ports is already connected"));
+			return;
+		}
+		bool bDryRun = false;
+		Req.Params->TryGetBoolField(TEXT("dry_run"), bDryRun);
+		Server.AddOp(MakeShared<FConnectOp>(Req, World, Recipe, A, B, bDryRun));
+	}
+
 	void Dismantle(FFAServer& Server, const FFARequest& Req)
 	{
 		UWorld* World = FACommands::FindGameWorld();
@@ -407,12 +676,31 @@ namespace FABuild
 			Server.ReplyError(Req, 400, TEXT("dismantle needs id, in a loaded game"));
 			return;
 		}
-		AFGBuildable* B = FindBuildable(World, Id);
 		TArray<FInventoryStack> Refund;
-		if (!B || !DismantleActor(B, Pawn->GetInventory(), Refund))
+		if (Id.StartsWith(TEXT("lw:")))
 		{
-			Server.ReplyError(Req, 404, FString::Printf(TEXT("%s not found or cannot be dismantled"), *Id));
-			return;
+			// lw:<Class>:<index>, as returned by query_area
+			TArray<FString> Parts;
+			Id.ParseIntoArray(Parts, TEXT(":"));
+			AFGLightweightBuildableSubsystem* LW = AFGLightweightBuildableSubsystem::Get(World);
+			UClass* Cls = Parts.Num() == 3 ? FindFirstObject<UClass>(*Parts[1], EFindFirstObjectOptions::None) : nullptr;
+			const TArray<FRuntimeBuildableInstanceData>* Arr = (LW && Cls) ? LW->GetAllLightweightBuildableInstances().Find(Cls) : nullptr;
+			const int32 Idx = Parts.Num() == 3 ? FCString::Atoi(*Parts[2]) : -1;
+			if (!Arr || !Arr->IsValidIndex(Idx) || !(*Arr)[Idx].BuiltWithRecipe ||
+			    !RemoveLightweight(World, Cls, (*Arr)[Idx].Transform.GetLocation(), (*Arr)[Idx].BuiltWithRecipe, Pawn->GetInventory(), Refund))
+			{
+				Server.ReplyError(Req, 404, FString::Printf(TEXT("%s not found"), *Id));
+				return;
+			}
+		}
+		else
+		{
+			AFGBuildable* B = FindBuildable(World, Id);
+			if (!B || !DismantleActor(B, Pawn->GetInventory(), Refund))
+			{
+				Server.ReplyError(Req, 404, FString::Printf(TEXT("%s not found or cannot be dismantled"), *Id));
+				return;
+			}
 		}
 		const TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("dismantled"), Id);
@@ -445,6 +733,13 @@ namespace FABuild
 			{
 				const FString Name = A->GetName();
 				if (DismantleActor(A.Get(), Pawn->GetInventory(), Refund)) Removed.Add(MakeShared<FJsonValueString>(Name));
+			}
+		}
+		for (const FLightweightRecord& L : GBuildLog[Index].Lightweights)
+		{
+			if (RemoveLightweight(World, L.Cls, L.Loc, L.Recipe, Pawn->GetInventory(), Refund))
+			{
+				Removed.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%s at %s"), *L.Cls->GetName(), *L.Loc.ToCompactString())));
 			}
 		}
 		GBuildLog.RemoveAt(Index);

@@ -24,6 +24,58 @@
 #include "Buildables/FGBuildableBlueprintDesigner.h"
 #include "Resources/FGItemDescriptor.h"
 #include "Resources/FGBuildingDescriptor.h"
+#include "Hologram/FGConveyorLiftHologram.h"
+
+/**
+ * Friend of AFGConveyorLiftHologram (see Config/AccessTransformers.ini). The build gun sets a lift's height from the
+ * player's aim; we set the top end to a target port instead.
+ */
+class FFALiftAccess
+{
+public:
+	static FString ForceTop(AFGConveyorLiftHologram* H, UFGFactoryConnectionComponent* TopPort)
+	{
+		if (!H || !TopPort) return TEXT("no lift hologram");
+		const FTransform Act = H->GetActorTransform();
+		const float Height = TopPort->GetComponentLocation().Z - Act.GetLocation().Z;
+		const FVector Want = -TopPort->GetConnectorNormal();  // the lift's top connection must face into the port
+		auto Apply = [&](float RelYaw)
+		{
+			H->mTopTransform = FTransform(FRotator(0, RelYaw, 0), FVector(0, 0, Height));
+			H->OnRep_TopTransform();
+		};
+		auto TopConn = [&]() -> UFGFactoryConnectionComponent*
+		{
+			UFGFactoryConnectionComponent* C0 = H->mConnectionComponents[0];
+			UFGFactoryConnectionComponent* C1 = H->mConnectionComponents[1];
+			if (!C0 || !C1) return C1 ? C1 : C0;
+			return C1->GetComponentLocation().Z >= C0->GetComponentLocation().Z ? C1 : C0;
+		};
+		float Rel = FRotator::NormalizeAxis(Want.Rotation().Yaw - Act.Rotator().Yaw);
+		Apply(Rel);
+		float Dot = TopConn() ? FVector::DotProduct(TopConn()->GetConnectorNormal(), Want) : 0.f;
+		if (Dot < 0.5f)
+		{
+			Rel = FRotator::NormalizeAxis(Rel + 180.f);
+			Apply(Rel);
+			Dot = TopConn() ? FVector::DotProduct(TopConn()->GetConnectorNormal(), Want) : 0.f;
+		}
+		H->mSnappedConnectionComponents[1] = TopPort;
+		H->UpdateConnectionDirections();
+		H->UpdateClearance();
+		const UFGFactoryConnectionComponent* T = TopConn();
+		return FString::Printf(TEXT("height %.1f m, top yaw %.0f, facing %.2f, top conn %.1f m from port"),
+			Height / 100.f, Rel, Dot, T ? FVector::Dist(T->GetComponentLocation(), TopPort->GetComponentLocation()) / 100.f : -1.f);
+	}
+
+	static FString State(AFGConveyorLiftHologram* H)
+	{
+		if (!H) return TEXT("-");
+		return FString::Printf(TEXT("top %s, snapped %s / %s"), *H->mTopTransform.GetLocation().ToCompactString(),
+			H->mSnappedConnectionComponents[0] ? *H->mSnappedConnectionComponents[0]->GetOwner()->GetName() : TEXT("-"),
+			H->mSnappedConnectionComponents[1] ? *H->mSnappedConnectionComponents[1]->GetOwner()->GetName() : TEXT("-"));
+	}
+};
 
 namespace
 {
@@ -515,16 +567,24 @@ namespace
 				{
 					Hologram->SetInsideBlueprintDesigner(D);
 				}
+				// Lifts are placed bottom first, whichever way items flow.
+				bLift = Hologram->IsA<AFGConveyorLiftHologram>();
+				First = A;
+				Second = B;
+				if (bLift && B->GetComponentLocation().Z < A->GetComponentLocation().Z)
+				{
+					Swap(First, Second);
+				}
 				return false;
 			}
-			if (!Hologram.IsValid())
+			if (!Hologram.IsValid() || !First.IsValid() || !Second.IsValid())
 			{
 				Server.ReplyError(Req, 500, TEXT("Hologram was destroyed"));
 				return true;
 			}
 			if (S <= 3)
 			{
-				Aim(A.Get());
+				Aim(First.Get());
 				return false;
 			}
 			if (S == 4)
@@ -536,7 +596,15 @@ namespace
 			}
 			if (S <= 8)
 			{
-				Aim(B.Get());
+				if (bLift)
+				{
+					// Aiming doesn't set a lift's height for us, so set the top end to the target port directly.
+					LiftReport = FFALiftAccess::ForceTop(Cast<AFGConveyorLiftHologram>(Hologram.Get()), Second.Get());
+				}
+				else
+				{
+					Aim(Second.Get());
+				}
 				return false;
 			}
 
@@ -548,6 +616,10 @@ namespace
 
 			const TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 			Result->SetStringField(TEXT("hologram"), Hologram->GetClass()->GetName());
+			if (bLift)
+			{
+				Result->SetStringField(TEXT("lift"), LiftReport + TEXT(" | ") + FFALiftAccess::State(Cast<AFGConveyorLiftHologram>(Hologram.Get())));
+			}
 			Result->SetNumberField(TEXT("step_before_click"), StartStep);
 			Result->SetNumberField(TEXT("step_after_click"), AfterClickStep);
 			Result->SetBoolField(TEXT("finished_after_first_click"), bFirstClickDone);
@@ -608,7 +680,9 @@ namespace
 
 		TWeakObjectPtr<UWorld> World;
 		TSubclassOf<UFGRecipe> Recipe;
-		TWeakObjectPtr<UFGFactoryConnectionComponent> A, B;
+		TWeakObjectPtr<UFGFactoryConnectionComponent> A, B, First, Second;
+		bool bLift = false;
+		FString LiftReport;
 		bool bDryRun;
 		int32 Step = 0;
 		int32 StartStep = -1, AfterClickStep = -1;

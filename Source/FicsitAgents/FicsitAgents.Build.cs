@@ -74,7 +74,8 @@ public class FicsitAgents : ModuleRules
 		});
 		
 		PrivateDependencyModuleNames.AddRange(new string[] {
-			// ... add private dependencies that you statically link with here ...	
+			// Agent bridge: TCP server, PNG encoding for captures
+			"Sockets", "Networking", "ImageWrapper", "RenderCore"
 		});
 		
 		DynamicallyLoadedModuleNames.AddRange(new string[] {
